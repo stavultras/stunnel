@@ -51,6 +51,12 @@ NOEXPORT void socks5_server_method(CLI *);
 NOEXPORT void socks5_server(CLI *);
 NOEXPORT int validate_connect_addr(CLI *);
 
+NOEXPORT void direct_client_late(CLI *);
+NOEXPORT const char *direct_server_init(SERVICE_OPTIONS *);
+NOEXPORT void direct_server_middle(CLI *);
+
+NOEXPORT void direct_socks5_client_late(CLI *);
+
 NOEXPORT void proxy_server_late(CLI *);
 
 NOEXPORT void cifs_client_middle(CLI *);
@@ -123,6 +129,11 @@ const char *protocol_init(SERVICE_OPTIONS *opt) {
         {.name="socks",
             .client={.late=socks_client_late},
             .server={.init=socks_server_init, .middle=socks_server_middle, .late=socks_server_late}},
+        {.name="direct",
+            .client={.late=direct_client_late},
+            .server={.init=direct_server_init, .middle=direct_server_middle}},
+        {.name="direct:socks5",
+            .client={.late=direct_socks5_client_late}},
         {.name="proxy",
             .server={.late=proxy_server_late}},
         {.name="cifs",
@@ -665,6 +676,261 @@ NOEXPORT int validate_connect_addr(CLI *c) {
         }
     }
     return 1;
+}
+
+/**************************************** direct */
+
+NOEXPORT void direct_client_late(CLI *c) {
+    SOCKADDR_UNION addr;
+
+    struct {
+        uint8_t type;
+        uint8_t addr[4], port[2];
+    } req_v4;
+
+#ifdef USE_IPv6
+    struct {
+        uint8_t type;
+        uint8_t addr[16], port[2];
+    } req_v6;
+#endif
+
+    if(c->opt->protocol_host) { /* explicit destination */
+        char *req=str_printf("%c%c%s", 0x01, (int)strlen(c->opt->protocol_host), c->opt->protocol_host);
+
+        s_log(LOG_INFO, "Sending direct host \"%s\"", c->opt->protocol_host);
+
+        s_ssl_write(c, req, (int)strlen(req));
+
+        str_free(req);
+    } else {
+        if(original_dst(c->local_rfd.fd, &addr))
+            throw_exception(c, 2); /* don't reset */
+
+        switch(addr.sa.sa_family) {
+            case AF_INET:
+                req_v4.type = 0x02;
+                memcpy(&req_v4.addr, &addr.in.sin_addr, 4);
+                memcpy(&req_v4.port, &addr.in.sin_port, 2);
+                s_log(LOG_INFO, "Sending direct IPv4 address");
+                s_ssl_write(c, &req_v4, sizeof req_v4);
+            break;
+#ifdef USE_IPv6
+            case AF_INET6:
+                req_v6.type = 0x03;
+                memcpy(&req_v6.addr, &addr.in6.sin6_addr, 16);
+                memcpy(&req_v6.port, &addr.in6.sin6_port, 2);
+                s_log(LOG_INFO, "Sending direct IPv6 address");
+                s_ssl_write(c, &req_v6, sizeof req_v6);
+            break;
+#endif
+            default:
+                s_log(LOG_ERR, "Unsupported address type 0x%02x", addr.sa.sa_family);
+                throw_exception(c, 2); /* don't reset */
+        }
+    }
+}
+
+NOEXPORT const char *direct_server_init(SERVICE_OPTIONS *opt) {
+    opt->option.protocol_endpoint=1;
+    return NULL;
+}
+
+NOEXPORT void direct_server_middle(CLI *c) {
+    uint8_t host_len, type;
+    uint8_t close_connection=0;
+
+    char *host_name;
+
+    struct ipv4 {
+        uint8_t addr[4], port[2];
+    } resp_v4;
+
+#ifdef USE_IPv6
+    struct ipv6 {
+        uint8_t addr[16], port[2];
+    } resp_v6;
+#endif
+
+    s_ssl_read(c, &type, 1);
+
+    switch (type) {
+        case 0x01: // hostname
+            s_ssl_read(c, &host_len, 1);
+            host_name=str_alloc((size_t)host_len+1);
+            s_ssl_read(c, host_name, host_len);
+
+            name2addrlist(&c->connect_addr, host_name);
+
+            if(c->connect_addr.num)
+                s_log(LOG_INFO, "direct: resolved \"%s\" to %u host(s)", host_name, c->connect_addr.num);
+            else {
+                s_log(LOG_ERR, "direct: failed to resolve \"%s\"", host_name);
+                close_connection=1;
+            }
+
+            str_free(host_name);
+        break;
+
+        case 0x02: // ipv4
+            c->connect_addr.num=1;
+            c->connect_addr.addr=str_alloc(sizeof(SOCKADDR_UNION));
+            c->connect_addr.addr[0].in.sin_family=AF_INET;
+            s_ssl_read(c, &resp_v4, 4+2);
+            memcpy(&c->connect_addr.addr[0].in.sin_addr, &resp_v4.addr, 4);
+            memcpy(&c->connect_addr.addr[0].in.sin_port, &resp_v4.port, 2);
+
+            s_log(LOG_INFO, "direct IPv4 address received");
+        break;
+#ifdef USE_IPv6
+        case 0x03: //ipv6
+            c->connect_addr.num=1;
+            c->connect_addr.addr=str_alloc(sizeof(SOCKADDR_UNION));
+            c->connect_addr.addr[0].in6.sin6_family=AF_INET6;
+            s_ssl_read(c, &resp_v6, 16+2);
+            memcpy(&c->connect_addr.addr[0].in6.sin6_addr, &resp_v6.addr, 16);
+            memcpy(&c->connect_addr.addr[0].in6.sin6_port, &resp_v6.port, 2);
+
+            s_log(LOG_INFO, "direct IPv6 address received");
+        break;
+#endif
+        default:
+            s_log(LOG_ERR, "Unsupported direct address type 0x%02x", type);
+            throw_exception(c, 2); /* don't reset */
+    }
+
+    if(close_connection)
+        throw_exception(c, 2); /* don't reset */
+}
+
+/**************************************** direct socks5 */
+
+NOEXPORT void direct_socks5_client_late(CLI *c) {
+    uint8_t version;
+
+    struct {
+        uint8_t ver, method;
+    } response;
+
+    uint8_t i, nmethods, *methods;
+
+    SOCKS5_UNION socks;
+    uint8_t host_len, close_connection = 1;
+    char *host_name, *port_name;
+    u_short port_number;
+
+    struct {
+        uint8_t type;
+        uint8_t addr[4], port[2];
+    } req_v4;
+
+#ifdef USE_IPv6
+    struct {
+        uint8_t type;
+        uint8_t addr[16], port[2];
+    } req_v6;
+#endif
+
+    s_read(c, c->local_rfd.fd, &version, sizeof version);
+
+    if(version != 0x05) {
+        s_log(LOG_ERR, "Invalid SOCKS5 message version 0x%02x", version);
+        throw_exception(c, 2); /* don't reset */
+    }
+
+    response.ver=0x05;
+    response.method=0xff; /* NO ACCEPTABLE METHODS */
+    s_read(c, c->local_rfd.fd, &nmethods, sizeof nmethods);
+    methods=str_alloc(nmethods);
+    s_read(c, c->local_rfd.fd, methods, nmethods);
+    for(i=0; i<nmethods; ++i)
+        if(methods[i]==0x00) { /* NO AUTHENTICATION REQUIRED */
+            response.method=0x00; /* use this method */
+            break;
+        }
+    str_free(methods);
+
+    s_write(c, c->local_wfd.fd, &response, sizeof response);
+
+    if(response.method) { /* request failed */
+        s_log(LOG_ERR, "No supported SOCKS5 authentication method received");
+        throw_exception(c, 2); /* don't reset */
+    }
+
+    memset(&socks, 0, sizeof socks);
+    s_read(c, c->local_rfd.fd, &socks, sizeof socks.req);
+
+    if(socks.req.ver!=0x05) {
+        s_log(LOG_ERR, "Invalid SOCKS5 message version 0x%02x", socks.req.ver);
+        socks.resp.ver=0x05; /* response version 5 */
+        socks.resp.rep=0x01; /* general SOCKS server failure */
+    } else if(socks.req.cmd==0x01) { /* CONNECT */
+        if(socks.req.atyp==0x01) { /* IP v4 address */
+            s_read(c, c->local_rfd.fd, &socks.v4.addr, 4+2);
+
+            req_v4.type = 0x02;
+            memcpy(&req_v4.addr, &socks.v4.addr, 4);
+            memcpy(&req_v4.port, &socks.v4.port, 2);
+
+            s_log(LOG_INFO, "SOCKS5 IPv4 address received");
+
+            s_ssl_write(c, &req_v4, sizeof req_v4);
+
+            socks.resp.rep=0x00; /* succeeded */
+            close_connection=0;
+        } else if(socks.req.atyp==0x03) { /* DOMAINNAME */
+            s_read(c, c->local_rfd.fd, &host_len, sizeof host_len);
+            host_name=str_alloc((size_t)host_len+1);
+            s_read(c, c->local_rfd.fd, host_name, host_len);
+            host_name[host_len]='\0';
+            s_read(c, c->local_rfd.fd, &port_number, 2);
+            port_name=str_printf("%u", ntohs(port_number));
+
+            char *req=str_printf("%c%c%s:%s", 0x01, (int)(strlen(host_name) + 1 + strlen(port_name)), host_name, port_name);
+
+            s_log(LOG_INFO, "SOCKS5 DOMAIN received \"%s:%s\"", host_name, port_name);
+
+            s_ssl_write(c, req, (int)strlen(req));
+
+            str_free(req);
+            str_free(port_name);
+            str_free(host_name);
+
+            socks.resp.rep=0x00;
+            close_connection=0;
+#ifdef USE_IPv6
+        } else if(socks.req.atyp==0x04) { /* IP v6 address */
+            s_read(c, c->local_rfd.fd, &socks.v6.addr, 16+2);
+
+            req_v6.type = 0x03;
+            memcpy(&req_v6.addr, &socks.v6.addr, 16);
+            memcpy(&req_v6.port, &socks.v6.port, 2);
+
+            s_log(LOG_INFO, "SOCKS5 IPv6 address received");
+
+            s_ssl_write(c, &req_v6, sizeof req_v6);
+
+            socks.resp.rep=0x00; /* succeeded */
+            close_connection=0;
+#endif
+        } else {
+            s_log(LOG_ERR,
+                "Unsupported SOCKS5 address type 0x%02x", socks.req.atyp);
+            socks.resp.rep=0x07; /* Address type not supported */
+        }
+    } else {
+        s_log(LOG_ERR, "Unsupported SOCKS5 command 0x%02x", socks.req.cmd);
+        socks.resp.rep=0x07; /* Command not supported */
+    }
+
+    if(socks.resp.atyp==0x04) { /* IP V6 address */
+        s_write(c, c->local_wfd.fd, &socks, sizeof socks.v6);
+    } else {
+        socks.resp.atyp=0x01; /* IP v4 address */
+        s_write(c, c->local_wfd.fd, &socks, sizeof socks.v4);
+    }
+    if(close_connection) /* request failed */
+        throw_exception(c, 2); /* don't reset */
 }
 
 /**************************************** proxy */

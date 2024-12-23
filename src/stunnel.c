@@ -1043,7 +1043,7 @@ void stunnel_info(int level) {
     int tls_feature_found=0;
     char *features;
 
-    s_log(level, "stunnel " STUNNEL_VERSION " on " HOST " platform");
+    s_log(level, "stunnel " STUNNEL_VERSION "-direct on " HOST " platform");
     if(strcmp(OPENSSL_VERSION_TEXT, OpenSSL_version(OPENSSL_VERSION))) {
         s_log(level, "Compiled with " OPENSSL_VERSION_TEXT);
         s_log(level, "Running  with %s", OpenSSL_version(OPENSSL_VERSION));
