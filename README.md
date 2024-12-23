@@ -1,5 +1,5 @@
 # Additional changes to the original stunnel
-Added "direct" protocol. It's very similar to socks5, but doesn't have excess socks5's handshakes which decreases latency. "direct" protocol doesn't use "auth" handshake. In my case I was able to reduce latency from 450 ms to 250 ms. However, if you still need socks5 client on stunnel client's side, you can use "direct:socks5" protocol.
+Added "direct" protocol. It's very similar to socks5, but doesn't have excess socks5's handshakes, which increase latency in a case of "socks" protocol in stunnel.conf file. "direct" protocol doesn't use "auth" handshake and sends data directly with TLS tunnel. In my case, I was able to reduce latency from 450 ms to 250 ms. However, if you still need socks5 client on stunnel client's side, you can use "direct:socks5" protocol together with "direct" protocol on a server's side. You can check all the changes in the following commit: https://github.com/stavultras/stunnel/commit/f21f49c25ddcbfd1c07ec3674ea8ab6cfb0f99d6
 
 
 # stunnel overview
